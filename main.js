@@ -8,13 +8,22 @@
 
 // No imports needed - Autocomplete will be available globally after loading the script
 
+// Configuration (override via window.FTG_CONFIG without editing this file)
+const DEFAULT_CONFIG = {
+    AIRTABLE_BASE_ID: 'appC9GXdjmEmFlNk7',
+    AIRTABLE_TABLE: 'tbl4YQBCXN4f2WREk', // Updated to match proxy example
+    AIRTABLE_PROXY_URL: 'https://ftg-proxy-tq3re.ondigitalocean.app/api/query',
+    DEBUG: false,
+};
+const CFG = { ...DEFAULT_CONFIG, ...(window.FTG_CONFIG || {}) };
+
 // Airtable Proxy Configuration
-const AIRTABLE_BASE_ID = 'appC9GXdjmEmFlNk7';
-const AIRTABLE_TABLE = 'tblSsW6kAWQd3LZVa'; // Updated to match proxy example
-const AIRTABLE_PROXY_URL = 'https://ftg-proxy-tq3re.ondigitalocean.app/api/query';
+const AIRTABLE_BASE_ID = CFG.AIRTABLE_BASE_ID;
+const AIRTABLE_TABLE = CFG.AIRTABLE_TABLE;
+const AIRTABLE_PROXY_URL = CFG.AIRTABLE_PROXY_URL;
 
 // Debug flag (toggle to silence verbose logs in production)
-const DEBUG = false;
+const DEBUG = !!CFG.DEBUG;
 
 // Mode configuration centralized
 const MODES = {
@@ -59,8 +68,34 @@ function debounce(fn, delay = 300) {
 let fields = {};
 let currentMode = 'Establishment Name Lookup';
 let autocompleteInstance = null;
+// Track last valid selection for establishment name to know when to invalidate
+let lastSelectedEstablishment = { id: null, name: null };
+// Controllers for canceling in-flight requests
+let nameSearchController = null;
+let codeLookupController = null;
+// Cached form element for submit gating
+let formEl = null;
+
+/**
+ * Reset all dependent form fields to defaults while preserving the provided exclusions
+ * (typically the currently edited text fields).
+ */
+function resetDependentFields(exclusions = []) {
+    const excludeSet = new Set(exclusions);
+    resetFields(exclusions);
+    // Ensure Custom Establishment Name is cleared unless explicitly excluded
+    if (!excludeSet.has('customEstablishmentName') && fields.customEstablishmentName?.input) {
+        fields.customEstablishmentName.input.value = '';
+    }
+    // Forget last valid selection
+    lastSelectedEstablishment.id = null;
+    lastSelectedEstablishment.name = null;
+    // Update submit gating
+    updateFormSubmitState();
+}
 
 // Map visible label text -> internal field key
+// Keep this minimal; fallback logic below handles minor label variations
 const FIELD_LABEL_TO_KEY = {
     'Redemption Code': 'redemptionCode',
     'Official Establishment Name': 'officialEstablishmentName',
@@ -71,6 +106,10 @@ const FIELD_LABEL_TO_KEY = {
     'Duties & Taxes': 'dutiesAndTaxes'
 };
 
+/**
+ * Scan the DOM for `.form-item` wrappers and build the fields map.
+ * Idempotent: safe to call on dynamic content updates.
+ */
 function initializeFields() {
     fields = {}; // reset in case of re-init
     const items = document.querySelectorAll('.form-item');
@@ -105,7 +144,7 @@ function initializeFields() {
             return; // ignore unrelated form-items
         }
         const input = item.querySelector('input');
-        const select = selectEl || item.querySelector('select');
+    const select = selectEl; // selectEl already queried above
         fields[key] = { label, wrapper: item, input, select };
     });
     if (DEBUG) console.log('Initialized fields (scanned .form-item):', Object.keys(fields));
@@ -126,12 +165,14 @@ function resetFields(exclusions = []) {
     });
 }
 
+/**
+ * Apply a UI mode by hiding/locking fields as configured.
+ */
 function setMode(mode) {
     currentMode = mode;
     const config = MODES[mode] || { hide: [], prevent: [] };
     hideElements(config.hide);
     preventInteraction(config.prevent);
-    if (mode === 'Establishment Name Lookup') addEstablishmentNameListener();
 }
 
 function hideElements(fieldNames) {
@@ -150,12 +191,16 @@ function preventInteraction(fieldNames) {
             if (DEBUG) console.warn(`Requested to prevent interaction on unknown field key: ${fieldName}`);
             return;
         }
-        console.log(`Preventing interaction with field: ${fieldName}`, field);
+    logger('debug', 'preventInteraction', `Preventing interaction with field: ${fieldName}`);
         preventEdit(field);
     });
 }
 
+/**
+ * Wire Bootstrap 5 Autocomplete to the Official Establishment Name input.
+ */
 function addEstablishmentNameListener() {
+    if (autocompleteInstance) return; // avoid duplicate init
     const officialEstablishmentNameField = fields['officialEstablishmentName']?.input;
     if (!officialEstablishmentNameField) {
         console.warn('Establishment name field not found for autocomplete');
@@ -172,23 +217,47 @@ function addEstablishmentNameListener() {
             source: debounce((query, callback) => {
                 if (DEBUG) console.log('Autocomplete source called with query:', query);
                 if (!parentForSpinner) { if (callback) callback([]); return []; }
+                // Clear any previous no-results message when typing
+                removeNoResultsMessage(parentForSpinner);
+                removeInlineErrorMessage(parentForSpinner);
                 showInlineSpinner(parentForSpinner, { position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)' });
                 if (query.length < 2) {
                     if (DEBUG) console.log('Query too short, returning empty results');
                     removeInlineSpinner(parentForSpinner);
+                    removeNoResultsMessage(parentForSpinner);
+                    removeInlineErrorMessage(parentForSpinner);
                     if (callback) callback([]);
                     return [];
                 }
-                return searchAirtableForAutocomplete(query)
+                // Cancel any in-flight search
+                if (nameSearchController) try { nameSearchController.abort(); } catch(e) { /* noop */ }
+                nameSearchController = new AbortController();
+                const signal = nameSearchController.signal;
+                return searchAirtableForAutocomplete(query, signal)
                     .then(results => {
                         if (DEBUG) console.log('Autocomplete results:', results);
                         removeInlineSpinner(parentForSpinner);
+                        removeInlineErrorMessage(parentForSpinner);
+                        if (!Array.isArray(results) || results.length === 0) {
+                            showNoResultsMessage(parentForSpinner, query, 'name');
+                        } else {
+                            removeNoResultsMessage(parentForSpinner);
+                        }
                         if (callback) callback(results);
                         return results;
                     })
                     .catch(error => {
+                        // Ignore abort errors (superseded request)
+                        if (error && (error.name === 'AbortError' || error.code === 20)) {
+                            removeInlineSpinner(parentForSpinner);
+                            return [];
+                        }
                         console.error('Error in autocomplete source:', error);
                         removeInlineSpinner(parentForSpinner);
+                        removeNoResultsMessage(parentForSpinner);
+                        const offline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
+                        const msg = offline ? 'You appear to be offline. Check your connection and try again.' : 'Something went wrong fetching results. Please try again.';
+                        showInlineErrorMessage(parentForSpinner, msg);
                         if (callback) callback([]);
                         return [];
                     });
@@ -196,7 +265,13 @@ function addEstablishmentNameListener() {
             onSelectItem: (item) => {
                 if (DEBUG) console.log('Selected establishment:', item);
                 if (item.data) {
+                    removeNoResultsMessage(parentForSpinner);
+                    removeInlineErrorMessage(parentForSpinner);
                     handleRedemptionCodeSelection(item.data);
+                    // Mark last valid name selection so edits can invalidate
+                    lastSelectedEstablishment.id = item.data.id || null;
+                    lastSelectedEstablishment.name = item.data.fields?.['Official Establishment Name'] || officialEstablishmentNameField.value || null;
+                    updateFormSubmitState();
                 } else {
                     console.warn('No data found for selected item');
                 }
@@ -207,16 +282,32 @@ function addEstablishmentNameListener() {
             showValue: false,
             showAllSuggestions: false
         });
-        if (DEBUG) console.log('Bootstrap 5 Autocomplete instance created successfully');
-        // Manual input listener no longer triggers duplicate fetches (autocomplete handles source)
-        officialEstablishmentNameField.addEventListener('focus', () => {
-            if (DEBUG) console.log('Field focused, ensuring lookup is ready');
+    if (DEBUG) console.log('Bootstrap 5 Autocomplete instance created successfully');
+        // Invalidate previously populated fields if user edits/clears without a valid selection
+    officialEstablishmentNameField.addEventListener('input', debounce(() => {
+            const current = (officialEstablishmentNameField.value || '').trim();
+            if (lastSelectedEstablishment.name && current !== lastSelectedEstablishment.name) {
+        // Reset all but the primary text inputs (keep what user typed)
+        resetDependentFields(['officialEstablishmentName', 'redemptionCode']);
+            }
+            if (!current) {
+        resetDependentFields(['officialEstablishmentName', 'redemptionCode']);
+            }
+        }, 250));
+        officialEstablishmentNameField.addEventListener('blur', () => {
+            const current = (officialEstablishmentNameField.value || '').trim();
+            if (!current || (lastSelectedEstablishment.name && current !== lastSelectedEstablishment.name)) {
+        resetDependentFields(['officialEstablishmentName', 'redemptionCode']);
+            }
         });
     } catch (error) {
         console.error('Error creating autocomplete instance:', error);
     }
 }
 
+/**
+ * Listen for redemption code input; when exactly 8 chars, query and populate.
+ */
 function addRedemptionCodeListener() {
     const redemptionCodeField = fields['redemptionCode']?.input;
     if (!redemptionCodeField) return;
@@ -224,34 +315,59 @@ function addRedemptionCodeListener() {
     const code = event.target.value.trim();
     // Reset all other fields except the code itself
     resetFields(['redemptionCode']);
+    // Clear any previous no-results message
+    removeNoResultsMessage(redemptionCodeField.parentNode);
+        removeInlineErrorMessage(redemptionCodeField.parentNode);
         const existingHelpText = redemptionCodeField.parentNode.querySelector('.help-text');
         if (existingHelpText) {
             existingHelpText.remove();
         }
-        if (code.length < 8 || code.length > 8) {
+    // Cancel any in-flight code lookup when input changes
+    if (codeLookupController) try { codeLookupController.abort(); } catch(e) { /* noop */ }
+    if (code.length !== 8) {
             const helpText = document.createElement('div');
             helpText.className = 'help-text';
             helpText.style.cssText = 'color: red; font-size: 12px; margin-top: 5px;';
             helpText.textContent = 'Please check redemption code length. It must be exactly 8 characters.';
             redemptionCodeField.parentNode.appendChild(helpText);
+            // Invalidate prior populated values if any
+            resetDependentFields(['redemptionCode', 'officialEstablishmentName']);
         }
         if (code.length === 8) {
             if (DEBUG) console.log('Redemption code entered:', code);
-            showFullscreenLoader('Loading...');
+            const parentForSpinner = redemptionCodeField.parentNode;
+            showInlineSpinner(parentForSpinner, { position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)' });
             try {
-                const data = await searchAirtable(code, 'Redemption Code');
+        codeLookupController = new AbortController();
+        const data = await queryAirtableContains('Redemption Code', code, codeLookupController.signal);
                 if (data.records.length > 0) {
+                    removeNoResultsMessage(redemptionCodeField.parentNode);
+                    removeInlineErrorMessage(redemptionCodeField.parentNode);
                     handleRedemptionCodeSelection(data.records[0]);
+                    // Track last valid name based on redemption selection
+                    lastSelectedEstablishment.id = data.records[0].id || null;
+                    lastSelectedEstablishment.name = data.records[0].fields?.['Official Establishment Name'] || fields.officialEstablishmentName?.input?.value || null;
                     if (DEBUG) console.log('Redemption code found and form populated');
+                    updateFormSubmitState();
                 } else {
-                    alert('Sorry, this redemption code is not valid. Please note that redemption codes are case-sensitive.');
+                    showNoResultsMessage(redemptionCodeField.parentNode, code, 'code');
                     console.warn('No matching record found for redemption code:', code);
+                    // Keep typed code, clear dependent selects + custom name
+                    resetDependentFields(['redemptionCode', 'officialEstablishmentName']);
                 }
             } catch (error) {
-                console.error('Error looking up redemption code:', error);
-                alert('Error looking up redemption code. Please try again.');
+                // Ignore abort errors quietly
+                if (!(error && (error.name === 'AbortError' || error.code === 20))) {
+                    console.error('Error looking up redemption code:', error);
+                    removeNoResultsMessage(redemptionCodeField.parentNode);
+                    const offline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
+                    const msg = offline ? 'You appear to be offline. Check your connection and try again.' : 'Something went wrong fetching results. Please try again.';
+                    showInlineErrorMessage(redemptionCodeField.parentNode, msg);
+                    // On error, also clear dependent values
+                    resetDependentFields(['redemptionCode', 'officialEstablishmentName']);
+                }
             } finally {
-                hideFullscreenLoader();
+                removeInlineSpinner(parentForSpinner);
             }
         }
     };
@@ -263,15 +379,17 @@ function addRedemptionCodeListener() {
     });
 }
 
-// Unified Airtable query via proxy server
-async function queryAirtableContains(field, query) {
+/**
+ * Unified Airtable query via proxy server with simple in-memory caching.
+ */
+async function queryAirtableContains(field, query, signal) {
     const cleanQuery = (query || '').trim();
     if (!cleanQuery) return { records: [] };
     const cacheKey = `${field}::${cleanQuery.toLowerCase()}`;
     const cached = cacheGet(cacheKey);
     if (cached) return cached;
     const url = `${AIRTABLE_PROXY_URL}?AIRTABLE_BASE_ID=${encodeURIComponent(AIRTABLE_BASE_ID)}&AIRTABLE_TABLE=${encodeURIComponent(AIRTABLE_TABLE)}&field=${encodeURIComponent(field)}&q=${encodeURIComponent(cleanQuery)}&maxRecords=10`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal });
     if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
@@ -280,8 +398,11 @@ async function queryAirtableContains(field, query) {
     return data;
 }
 
-async function searchAirtableForAutocomplete(query) {
-    const data = await queryAirtableContains('Official Establishment Name', query);
+/**
+ * Data adapter for Autocomplete: returns [{label, value, data}] from Airtable.
+ */
+async function searchAirtableForAutocomplete(query, signal) {
+    const data = await queryAirtableContains('Official Establishment Name', query, signal);
     if (!data.records) return [];
     return data.records
         .filter(r => {
@@ -294,10 +415,11 @@ async function searchAirtableForAutocomplete(query) {
         });
 }
 
-async function searchAirtable(query, field) {
-    return queryAirtableContains(field, query);
-}
+// searchAirtable alias removed — use queryAirtableContains directly
 
+/**
+ * Populate related fields from a selected Airtable record.
+ */
 function handleRedemptionCodeSelection(record) {
     const recFields = record.fields;
     if (recFields['Official Establishment Name']) {
@@ -327,7 +449,10 @@ function handleRedemptionCodeSelection(record) {
     );
 }
 
-// Unified select value setter (combines previous setSelectValue & setDynamicSelectValue logic)
+/**
+ * Set a select's value by matching on text/value/data-name (case-insensitive).
+ * Falls back to an inline mismatch hint if no option can be matched.
+ */
 function setSelectValue(selectElement, targetValue) {
     if (!selectElement || !targetValue) return false;
     const options = Array.from(selectElement.querySelectorAll('option')).map(o => ({
@@ -369,14 +494,7 @@ function setSelectValue(selectElement, targetValue) {
             msgEl.textContent = `This product does not meet your establishment details. This product does not have "${targetValue}" for the option "${labelText}".`;
         }
     } catch(e) { /* noop */ }
-    try {
-        const stamp = `mismatch::${targetValue}`;
-        const already = selectElement.getAttribute('data-mismatch-shown');
-        if (already !== stamp) {
-            selectElement.setAttribute('data-mismatch-shown', stamp);
-            alert(`This product does not meet your establishment details.\n\nMissing option: ${targetValue}`);
-        }
-    } catch(e) { /* noop */ }
+    // Removed blocking alert to streamline UX; inline message above is sufficient
     return false;
 }
 
@@ -391,13 +509,11 @@ function clearAndResetForm() {
     }
 }
 
-// Removed unused createSpinner()
-
 // Inject minimal CSS once
 let loaderStylesInjected = false;
 function ensureLoaderStyles() {
     if (loaderStylesInjected) return;
-    const css = `/* Loader Utilities */\n.loading-inline-spinner{display:inline-flex;align-items:center;font-size:12px;color:#555;font-family:system-ui,Arial,sans-serif;gap:6px;}\n.loading-inline-spinner .dot{width:6px;height:6px;border-radius:50%;background:#888;animation:ftg-bounce 0.9s infinite ease-in-out;}\n.loading-inline-spinner .dot:nth-child(2){animation-delay:0.15s;}\n.loading-inline-spinner .dot:nth-child(3){animation-delay:0.3s;}\n@keyframes ftg-bounce{0%,80%,100%{opacity:.3;transform:translateY(0);}40%{opacity:1;transform:translateY(-4px);}}\n.ftg-fullscreen-loader{position:fixed;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;background:rgba(0,0,0,.72);color:#fff;z-index:9999;font-family:system-ui,Arial,sans-serif;backdrop-filter:saturate(140%) blur(2px);}\n.ftg-fullscreen-loader.hidden{opacity:0;pointer-events:none;transition:opacity .25s ease;}\n.ftg-fullscreen-loader .message{margin-top:12px;font-size:16px;letter-spacing:.5px;}\n.ftg-spinner-ring{width:46px;height:46px;border:4px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:ftg-spin 0.9s linear infinite;}\n@keyframes ftg-spin{to{transform:rotate(360deg);}}`;
+    const css = `/* Loader Utilities */\n.loading-inline-spinner{display:inline-flex;align-items:center;font-size:12px;color:#555;font-family:system-ui,Arial,sans-serif;gap:6px;}\n.loading-inline-spinner .dot{width:6px;height:6px;border-radius:50%;background:#888;animation:ftg-bounce 0.9s infinite ease-in-out;}\n.loading-inline-spinner .dot:nth-child(2){animation-delay:0.15s;}\n.loading-inline-spinner .dot:nth-child(3){animation-delay:0.3s;}\n@keyframes ftg-bounce{0%,80%,100%{opacity:.3;transform:translateY(0);}40%{opacity:1;transform:translateY(-4px);}}\n/* Inline messages */\n.ftg-inline-msg{margin-top:6px;font-size:12px;line-height:1.3;color:#6c757d;font-family:system-ui,Arial,sans-serif;}\n.ftg-inline-msg.no-results{color:#b00020;}\n.ftg-inline-msg.error{color:#b00020;}`;
     const styleTag = document.createElement('style');
     styleTag.setAttribute('data-ftg-loader-styles', '');
     styleTag.textContent = css;
@@ -411,9 +527,25 @@ function showInlineSpinner(container, inlineStyleOverrides = {}) {
     ensureLoaderStyles();
     // Avoid duplicates
     if (container.querySelector(':scope > .loading-inline-spinner')) return;
+    // If we plan to absolutely position inside the field, ensure the container can anchor it
+    const willBeAbsolute = inlineStyleOverrides && String(inlineStyleOverrides.position || '').toLowerCase() === 'absolute';
+    if (willBeAbsolute) {
+        const cs = window.getComputedStyle(container);
+        if (cs && cs.position === 'static') {
+            // remember previous position to restore later
+            container.dataset.ftgPrevPosition = 'static';
+            container.style.position = 'relative';
+        }
+    }
     const wrap = document.createElement('div');
     wrap.className = 'loading-inline-spinner';
     Object.assign(wrap.style, inlineStyleOverrides);
+    // Ensure it doesn't block input interactions when overlayed
+    wrap.style.pointerEvents = 'none';
+    if (willBeAbsolute) {
+        wrap.style.zIndex = '2';
+        wrap.style.gap = '4px';
+    }
     // 3 animated dots + accessible text (visually hidden or standard?)
     ['dot','dot','dot'].forEach(()=>{ const d=document.createElement('span'); d.className='dot'; wrap.appendChild(d); });
     const text = document.createElement('span');
@@ -421,61 +553,86 @@ function showInlineSpinner(container, inlineStyleOverrides = {}) {
     text.style.fontSize = '11px';
     text.style.textTransform = 'uppercase';
     text.style.letterSpacing = '1px';
+    // When inside the input (absolute), hide the text to keep UI compact
+    if (willBeAbsolute) {
+        text.style.display = 'none';
+        text.setAttribute('aria-hidden', 'true');
+    }
     wrap.appendChild(text);
     container.appendChild(wrap);
+
+    // If overlaying inside an input field, add right padding so text doesn't overlap
+    if (willBeAbsolute) {
+        const inputEl = container.querySelector('input');
+        if (inputEl) {
+            if (!inputEl.dataset.ftgSpinnerPadApplied) {
+                inputEl.dataset.ftgSpinnerPadApplied = '1';
+                inputEl.dataset.ftgSpinnerPrevPadRight = inputEl.style.paddingRight || '';
+                inputEl.style.paddingRight = '2.25rem';
+            }
+        }
+    }
     return wrap;
 }
 function removeInlineSpinner(container) {
     if (!container) return;
     const el = container.querySelector(':scope > .loading-inline-spinner');
     if (el) el.remove();
+    // Restore input padding if we changed it
+    const inputEl = container.querySelector('input');
+    if (inputEl && inputEl.dataset.ftgSpinnerPadApplied) {
+        inputEl.style.paddingRight = inputEl.dataset.ftgSpinnerPrevPadRight || '';
+        delete inputEl.dataset.ftgSpinnerPadApplied;
+        delete inputEl.dataset.ftgSpinnerPrevPadRight;
+    }
+    // Restore container position if we modified it
+    if (container.dataset.ftgPrevPosition === 'static') {
+        container.style.position = '';
+        delete container.dataset.ftgPrevPosition;
+    }
 }
 
-// Fullscreen loader helpers
-let fullscreenLoaderRef = null;
-function showFullscreenLoader(message = 'Loading...') {
+// Inline no-results message helpers
+function showNoResultsMessage(container, queryText, searchType = 'generic') {
+    if (!container) return;
     ensureLoaderStyles();
-    if (!fullscreenLoaderRef) {
-        const root = document.createElement('div');
-        root.className = 'ftg-fullscreen-loader';
-        const spinner = document.createElement('div');
-        spinner.className = 'ftg-spinner-ring';
-        const msg = document.createElement('div');
-        msg.className = 'message';
-        msg.textContent = message;
-        root.appendChild(spinner); root.appendChild(msg);
-        document.body.appendChild(root);
-        fullscreenLoaderRef = root;
-    } else {
-        const msg = fullscreenLoaderRef.querySelector('.message');
-        if (msg) msg.textContent = message;
-        fullscreenLoaderRef.classList.remove('hidden');
-    }
-}
-function hideFullscreenLoader() {
-    if (fullscreenLoaderRef) {
-        fullscreenLoaderRef.classList.add('hidden');
-        // Optional: remove after transition
-        setTimeout(()=>{ if (fullscreenLoaderRef && fullscreenLoaderRef.classList.contains('hidden')) { fullscreenLoaderRef.remove(); fullscreenLoaderRef = null; } }, 350);
-    }
-}
-
-/**
- * Utility function to log errors with context and timestamp
- * @param {string} functionName - Name of the function where error occurred
- * @param {Error|string} error - The error object or message
- * @param {Object} context - Additional context data
- */
-function logError(functionName, error, context = {}) {
-    const errorEntry = {
-        timestamp: new Date().toISOString(),
-        function: functionName,
-        error: error.message || error,
-        stack: error.stack || 'No stack trace available',
-        context: context
+    // Remove any existing to avoid duplicates
+    removeNoResultsMessage(container);
+    const msg = document.createElement('div');
+    msg.className = 'ftg-inline-msg no-results';
+    msg.setAttribute('role', 'status');
+    msg.setAttribute('aria-live', 'polite');
+    const messages = {
+        name: `No Official Establishment Name matches "${queryText}".`,
+        code: `No Redemption Code matches "${queryText}".`,
     };
+    msg.textContent = messages[searchType] || `No results found for "${queryText}".`;
+    container.appendChild(msg);
+    return msg;
+}
+function removeNoResultsMessage(container) {
+    if (!container) return;
+    const el = container.querySelector(':scope > .ftg-inline-msg.no-results');
+    if (el) el.remove();
+}
 
-    console.error(`[ERROR] ${functionName}:`, error, context);
+// Inline error message helpers (network/offline)
+function showInlineErrorMessage(container, message) {
+    if (!container) return;
+    ensureLoaderStyles();
+    removeInlineErrorMessage(container);
+    const msg = document.createElement('div');
+    msg.className = 'ftg-inline-msg error';
+    msg.setAttribute('role', 'alert');
+    msg.setAttribute('aria-live', 'assertive');
+    msg.textContent = message;
+    container.appendChild(msg);
+    return msg;
+}
+function removeInlineErrorMessage(container) {
+    if (!container) return;
+    const el = container.querySelector(':scope > .ftg-inline-msg.error');
+    if (el) el.remove();
 }
 
 // Unified logger (replaces debugLog)
@@ -496,6 +653,9 @@ function logger(level, scope, message, meta = null) {
  * @param {string} officialEstablishmentName - Name of the establishment
  * @param {string} partnerStatus - Partner status of the establishment
  * @param {string} awardLevel - Award level of the establishment
+ */
+/**
+ * Update all select inputs based on the chosen establishment record fields.
  */
 const updateSelectElements = (officialEstablishmentName, partnerStatus, awardLevel, dutiesAndTaxes) => {
     const functionName = 'updateSelectElements';
@@ -520,28 +680,21 @@ const updateSelectElements = (officialEstablishmentName, partnerStatus, awardLev
     const dutiesAndTaxesSelectField = fields.dutiesAndTaxes?.select;
     if (dutiesAndTaxesSelectField) setSelectValue(dutiesAndTaxesSelectField, dutiesAndTaxes);
     } catch (error) {
-        logError(functionName, error, { officialEstablishmentName, partnerStatus, awardLevel, dutiesAndTaxes });
+        logger('error', functionName, 'Failed updating select elements', { error: error?.message, officialEstablishmentName, partnerStatus, awardLevel, dutiesAndTaxes });
         throw error; // Re-throw for caller to handle
     }
 };
 
-// Refactored utility functions for better modularity
-function logSelectOptions(selectElement) {
-    const options = selectElement.querySelectorAll('option');
-    return Array.from(options).map(option => ({
-        text: option.textContent?.trim() || '',
-        value: option.value || '',
-        dataName: option.getAttribute('data-name') || ''
-    }));
+// Enable/disable submit buttons based on whether a valid selection exists
+function updateFormSubmitState() {
+    if (!formEl) return;
+    const enabled = !!(lastSelectedEstablishment && lastSelectedEstablishment.id);
+    const submits = formEl.querySelectorAll('button[type="submit"], input[type="submit"]');
+    submits.forEach(btn => {
+        btn.disabled = !enabled;
+        btn.setAttribute('aria-disabled', String(!enabled));
+    });
 }
-
-// Removed setDynamicSelectValue in favor of unified setSelectValue
-
-// Removed logOptionsAndDatabaseValues (debug utility)
-
-// Refactored initialization logic
-
-// Removed setSelectValues (debug inspector)
 
 // Updated form submission logic
 function handleFormSubmission(form) {
@@ -580,10 +733,11 @@ $(document).ready(function() {
 
         const form = document.querySelector('form');
         if (form) {
+            formEl = form;
+            updateFormSubmitState();
             handleFormSubmission(form);
         }
 
-    // Removed debug select value logging
     }
 
     if (typeof window.Autocomplete !== 'undefined') {
@@ -600,6 +754,22 @@ $(document).ready(function() {
     }
 });
 
+/**
+ * Minimal public API for optional external control
+ */
+window.FTGForm = window.FTGForm || {
+    reinitialize: () => {
+        try { initializeFields(); } catch (e) { console.error('FTGForm.reinitialize error:', e); }
+    },
+    reset: () => {
+        try { clearAndResetForm(); } catch (e) { console.error('FTGForm.reset error:', e); }
+    },
+    setMode: (mode) => {
+        try { setMode(mode); } catch (e) { console.error('FTGForm.setMode error:', e); }
+    },
+    get config() { return { ...CFG }; },
+};
+
 // Simplified resetField function
 function resetField(field) {
     if (!field) return;
@@ -607,7 +777,7 @@ function resetField(field) {
     try {
         const element = field.input || field.select;
         if (element) {
-            console.log(`Resetting field: ${element.name}, previous value: ${element.value}`);
+            logger('debug', 'resetField', 'Reset field', { name: element.name, previous: element.value });
             element.value = '';
             if (field.select) {
                 field.select.selectedIndex = 0;
