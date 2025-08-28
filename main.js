@@ -2,7 +2,7 @@
  * Forbes Travel Guide - Simplified Form System
  * 
  * This system manages a dual-mode form:
- * 1. Redemption Code Lookup - Auto-populate from 8-character codes
+ * 1. Partner Early-Access Code Lookup - Auto-populate from 8-character codes
  * 2. Establishment Name Lookup - Search via autocomplete
  */
 
@@ -27,7 +27,7 @@ const DEBUG = !!CFG.DEBUG;
 
 // Mode configuration centralized
 const MODES = {
-    'Redemption Code Lookup': {
+    'Partner Early-Access Code Lookup': {
         hide: [],
         prevent: ['establishmentType', 'partnerStatus', 'awardLevel', 'dutiesAndTaxes', 'officialEstablishmentName']
     },
@@ -66,13 +66,15 @@ function debounce(fn, delay = 300) {
 
 // Module-level state
 let fields = {};
-let currentMode = 'Establishment Name Lookup';
+let currentMode = 'Partner Early-Access Code Lookup';
 let autocompleteInstance = null;
 // Track last valid selection for establishment name to know when to invalidate
 let lastSelectedEstablishment = { id: null, name: null };
 // Controllers for canceling in-flight requests
 let nameSearchController = null;
 let codeLookupController = null;
+// Prevent showing duplicate blocking alerts in rapid succession
+let mismatchAlertDispatched = false;
 // Cached form element for submit gating
 let formEl = null;
 
@@ -97,7 +99,7 @@ function resetDependentFields(exclusions = []) {
 // Map visible label text -> internal field key
 // Keep this minimal; fallback logic below handles minor label variations
 const FIELD_LABEL_TO_KEY = {
-    'Redemption Code': 'redemptionCode',
+    'Partner Early-Access Code': 'redemptionCode',
     'Official Establishment Name': 'officialEstablishmentName',
     'Custom Establishment Name': 'customEstablishmentName',
     'Establishment Type': 'establishmentType',
@@ -306,7 +308,7 @@ function addEstablishmentNameListener() {
 }
 
 /**
- * Listen for redemption code input; when exactly 8 chars, query and populate.
+ * Listen for Partner Early-Access Code input; when exactly 8 chars, query and populate.
  */
 function addRedemptionCodeListener() {
     const redemptionCodeField = fields['redemptionCode']?.input;
@@ -328,37 +330,38 @@ function addRedemptionCodeListener() {
             const helpText = document.createElement('div');
             helpText.className = 'help-text';
             helpText.style.cssText = 'color: red; font-size: 12px; margin-top: 5px;';
-            helpText.textContent = 'Please check redemption code length. It must be exactly 8 characters.';
+            helpText.textContent = 'Please check Partner Early-Access Code length. It must be exactly 8 characters.';
             redemptionCodeField.parentNode.appendChild(helpText);
             // Invalidate prior populated values if any
             resetDependentFields(['redemptionCode', 'officialEstablishmentName']);
         }
         if (code.length === 8) {
-            if (DEBUG) console.log('Redemption code entered:', code);
+            if (DEBUG) console.log('Partner Early-Access Code entered:', code);
             const parentForSpinner = redemptionCodeField.parentNode;
             showInlineSpinner(parentForSpinner, { position: 'absolute', right: '10px', top: '50%', transform: 'translateY(-50%)' });
             try {
         codeLookupController = new AbortController();
-        const data = await queryAirtableContains('Redemption Code', code, codeLookupController.signal);
-                if (data.records.length > 0) {
+                // Note: Airtable column is still named 'Redemption Code' so we query that field; UI label changed to Partner Early-Access Code
+                const data = await queryAirtableContains('Redemption Code', code, codeLookupController.signal);
+                    if (data.records.length > 0) {
                     removeNoResultsMessage(redemptionCodeField.parentNode);
                     removeInlineErrorMessage(redemptionCodeField.parentNode);
                     handleRedemptionCodeSelection(data.records[0]);
                     // Track last valid name based on redemption selection
                     lastSelectedEstablishment.id = data.records[0].id || null;
                     lastSelectedEstablishment.name = data.records[0].fields?.['Official Establishment Name'] || fields.officialEstablishmentName?.input?.value || null;
-                    if (DEBUG) console.log('Redemption code found and form populated');
+                    if (DEBUG) console.log('Partner Early-Access Code found and form populated');
                     updateFormSubmitState();
                 } else {
                     showNoResultsMessage(redemptionCodeField.parentNode, code, 'code');
-                    console.warn('No matching record found for redemption code:', code);
+                    console.warn('No matching record found for Partner Early-Access Code:', code);
                     // Keep typed code, clear dependent selects + custom name
                     resetDependentFields(['redemptionCode', 'officialEstablishmentName']);
                 }
             } catch (error) {
                 // Ignore abort errors quietly
                 if (!(error && (error.name === 'AbortError' || error.code === 20))) {
-                    console.error('Error looking up redemption code:', error);
+                    console.error('Error looking up Partner Early-Access Code:', error);
                     removeNoResultsMessage(redemptionCodeField.parentNode);
                     const offline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
                     const msg = offline ? 'You appear to be offline. Check your connection and try again.' : 'Something went wrong fetching results. Please try again.';
@@ -483,15 +486,35 @@ function setSelectValue(selectElement, targetValue) {
     try {
         const wrapper = selectElement.closest('.form-item');
         if (wrapper) {
-            let msgEl = wrapper.querySelector('.mismatch-text');
-            if (!msgEl) {
-                msgEl = document.createElement('div');
-                msgEl.className = 'mismatch-text';
-                msgEl.style.cssText = 'color: #b00020; font-size: 12px; margin-top: 4px; line-height:1.3;';
-                wrapper.appendChild(msgEl);
+            let messageElement = wrapper.querySelector('.mismatch-text');
+            if (!messageElement) {
+                messageElement = document.createElement('div');
+                messageElement.className = 'mismatch-text';
+                messageElement.style.cssText = 'color: #b00020; font-size: 12px; margin-top: 4px; line-height:1.3;';
+                wrapper.appendChild(messageElement);
             }
-            const labelText = wrapper.querySelector('label')?.textContent?.trim() || 'Field';
-            msgEl.textContent = `This product does not meet your establishment details. This product does not have "${targetValue}" for the option "${labelText}".`;
+            // Read label text and remove common adornments like '(required)' or trailing colons
+            const rawLabelText = wrapper.querySelector('label')?.textContent || 'Field';
+            const labelText = rawLabelText.replace(/\(required\)/i, '').replace(/:$/, '').trim() || 'Field';
+            // Normalize establishment value for display (arrays -> joined string)
+            const establishmentValue = Array.isArray(targetValue) ? targetValue.join(', ') : String(targetValue);
+            messageElement.textContent = `This product does not meet your establishment details. This product does not have "${establishmentValue}" for the option "${labelText}".`;
+            // Show blocking alert to the user with the requested message, then clear the form after they click OK
+            try {
+                if (!mismatchAlertDispatched) {
+                    mismatchAlertDispatched = true;
+                    const alertMsg = `There is no product option for your {feild type} of {establishment value}. Please change the establishment you are shopping for or chose a product that supports your {feild type} of {establishment value}.`;
+                    const populated = alertMsg.replace(/{feild type}/g, labelText).replace(/{establishment value}/g, establishmentValue);
+                    window.alert(populated);
+                    // allow future alerts after a short cooldown
+                    setTimeout(() => { mismatchAlertDispatched = false; }, 1200);
+                }
+            } catch (e) {
+                // If alert fails for some reason, log and continue
+                console.error('Failed to show mismatch alert:', e);
+            }
+            // Clear the form after user dismisses the alert
+            try { clearAndResetForm(); } catch (e) { console.error('Failed to clear form after mismatch alert:', e); }
         }
     } catch(e) { /* noop */ }
     // Removed blocking alert to streamline UX; inline message above is sufficient
@@ -500,11 +523,35 @@ function setSelectValue(selectElement, targetValue) {
 
 function clearAndResetForm() {
     resetFields();
-    const preventList = currentMode === 'Redemption Code Lookup'
+    // Clear any inline UI messages (errors, no-results, spinners, mismatch hints) from the form
+    try {
+        // Clear at the per-field wrapper level
+        Object.values(fields || {}).forEach(fieldObj => {
+            try {
+                const wrapper = fieldObj?.wrapper || (fieldObj?.input && fieldObj.input.parentNode) || (fieldObj?.select && fieldObj.select.parentNode);
+                if (wrapper) {
+                    removeInlineErrorMessage(wrapper);
+                    removeNoResultsMessage(wrapper);
+                    removeInlineSpinner(wrapper);
+                    const mismatchHint = wrapper.querySelector('.mismatch-text');
+                    if (mismatchHint) mismatchHint.remove();
+                }
+            } catch (e) { /* noop per-field */ }
+        });
+        // Also clear any inline messages attached to the form itself
+        if (formEl) {
+            removeInlineErrorMessage(formEl);
+            removeNoResultsMessage(formEl);
+            removeInlineSpinner(formEl);
+        }
+    } catch (e) {
+        if (DEBUG) console.error('Error clearing inline messages during form reset:', e);
+    }
+    const preventList = currentMode === 'Partner Early-Access Code Lookup'
         ? ['establishmentType', 'partnerStatus', 'awardLevel', 'dutiesAndTaxes', 'officialEstablishmentName']
         : ['establishmentType', 'partnerStatus', 'awardLevel', 'dutiesAndTaxes'];
     preventInteraction(preventList);
-    if (currentMode !== 'Redemption Code Lookup' && autocompleteInstance && getField('officialEstablishmentName')?.input) {
+    if (currentMode !== 'Partner Early-Access Code Lookup' && autocompleteInstance && getField('officialEstablishmentName')?.input) {
         getField('officialEstablishmentName').input.value = '';
     }
 }
@@ -598,17 +645,17 @@ function showNoResultsMessage(container, queryText, searchType = 'generic') {
     ensureLoaderStyles();
     // Remove any existing to avoid duplicates
     removeNoResultsMessage(container);
-    const msg = document.createElement('div');
-    msg.className = 'ftg-inline-msg no-results';
-    msg.setAttribute('role', 'status');
-    msg.setAttribute('aria-live', 'polite');
+    const messageElement = document.createElement('div');
+    messageElement.className = 'ftg-inline-msg no-results';
+    messageElement.setAttribute('role', 'status');
+    messageElement.setAttribute('aria-live', 'polite');
     const messages = {
         name: `No Official Establishment Name matches "${queryText}".`,
-        code: `No Redemption Code matches "${queryText}".`,
+    code: `No Partner Early-Access Code matches "${queryText}".`,
     };
-    msg.textContent = messages[searchType] || `No results found for "${queryText}".`;
-    container.appendChild(msg);
-    return msg;
+    messageElement.textContent = messages[searchType] || `No results found for "${queryText}".`;
+    container.appendChild(messageElement);
+    return messageElement;
 }
 function removeNoResultsMessage(container) {
     if (!container) return;
@@ -621,13 +668,13 @@ function showInlineErrorMessage(container, message) {
     if (!container) return;
     ensureLoaderStyles();
     removeInlineErrorMessage(container);
-    const msg = document.createElement('div');
-    msg.className = 'ftg-inline-msg error';
-    msg.setAttribute('role', 'alert');
-    msg.setAttribute('aria-live', 'assertive');
-    msg.textContent = message;
-    container.appendChild(msg);
-    return msg;
+    const messageElement = document.createElement('div');
+    messageElement.className = 'ftg-inline-msg error';
+    messageElement.setAttribute('role', 'alert');
+    messageElement.setAttribute('aria-live', 'assertive');
+    messageElement.textContent = message;
+    container.appendChild(messageElement);
+    return messageElement;
 }
 function removeInlineErrorMessage(container) {
     if (!container) return;
