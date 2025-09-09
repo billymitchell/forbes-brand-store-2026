@@ -175,6 +175,39 @@ function setMode(mode) {
     const config = MODES[mode] || { hide: [], prevent: [] };
     hideElements(config.hide);
     preventInteraction(config.prevent);
+    updateModeNote(mode);
+}
+
+// Insert / remove a mode-specific note above the form with id="edit_website_product"
+const MODE_NOTE_ID = 'ftg-mode-note';
+// Mode note HTML (includes mailto link). Kept wording as provided; added missing space before 'for assistance.'
+const MODE_NOTE_HTML = 'Note: Until the Star Rating announcement on February 11, 2026, only Global Partners can place Store orders. Please use the Redemption Code provided to your General Manager. Contact <a href="mailto:support@forbestravelguide.com" style="color:#5b4400;text-decoration:underline;">support@forbestravelguide.com</a> for assistance.';
+
+function updateModeNote(mode) {
+    try {
+        const form = document.getElementById('edit_website_product');
+        if (!form) return; // form not present yet
+        let existing = document.getElementById(MODE_NOTE_ID);
+        const shouldShow = mode === 'Partner Early-Access Code Lookup';
+        if (shouldShow) {
+            if (!existing) {
+                existing = document.createElement('div');
+                existing.id = MODE_NOTE_ID;
+                existing.setAttribute('role', 'note');
+                existing.style.cssText = 'background:#fff8e1;border:1px solid #f3d27a;color:#5b4400;padding:12px 14px;margin:0 0 14px 0;font-size:14px;line-height:1.4;font-family:system-ui,Arial,sans-serif;border-radius:4px;';
+                    existing.innerHTML = MODE_NOTE_HTML;
+                form.parentNode.insertBefore(existing, form);
+            } else {
+                // Ensure text is up to date (in case of future edits)
+                    // Ensure HTML is up to date (in case of future edits)
+                    if (existing.innerHTML !== MODE_NOTE_HTML) existing.innerHTML = MODE_NOTE_HTML;
+            }
+        } else if (existing) {
+            existing.remove();
+        }
+    } catch (e) {
+        if (DEBUG) console.error('Failed updating mode note:', e);
+    }
 }
 
 function hideElements(fieldNames) {
@@ -498,13 +531,14 @@ function setSelectValue(selectElement, targetValue) {
             const labelText = rawLabelText.replace(/\(required\)/i, '').replace(/:$/, '').trim() || 'Field';
             // Normalize establishment value for display (arrays -> joined string)
             const establishmentValue = Array.isArray(targetValue) ? targetValue.join(', ') : String(targetValue);
-            messageElement.textContent = `This product does not meet your establishment details. This product does not have "${establishmentValue}" for the option "${labelText}".`;
+            // Unified mismatch inline message: only reference the missing value (not the field label)
+            messageElement.textContent = `This product does not have an option for "${establishmentValue}".`;
             // Show blocking alert to the user with the requested message, then clear the form after they click OK
             try {
                 if (!mismatchAlertDispatched) {
                     mismatchAlertDispatched = true;
-                    const alertMsg = `There is no product option for your {feild type} of {establishment value}. Please change the establishment you are shopping for or chose a product that supports your {feild type} of {establishment value}.`;
-                    const populated = alertMsg.replace(/{feild type}/g, labelText).replace(/{establishment value}/g, establishmentValue);
+                    const alertMsg = `Sorry, this product does not have a "{establishment value}" option. Please select a different product.`;
+                    const populated = alertMsg.replace(/{establishment value}/g, establishmentValue);
                     window.alert(populated);
                     // allow future alerts after a short cooldown
                     setTimeout(() => { mismatchAlertDispatched = false; }, 1200);
